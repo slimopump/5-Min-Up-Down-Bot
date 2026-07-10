@@ -1,523 +1,493 @@
-# Polymarket 5-Min BTC Spike Bot
+# Gabigol — Polymarket Crypto Up/Down Bot
 
-Quantitative trading bot for Polymarket's rolling **5-minute Bitcoin Up/Down** binary markets. It listens to **Oracle** (BTC-USD lead feed) and **Chainlink BTC/USD via Polymarket RTDS** (resolution oracle), detects short-term momentum spikes, buys the **underdog** token before the book reprices, and optionally **hedges** on an opposite spike to cap downside. Positions settle at **$1 / $0** against Chainlink at window close — not exchange spot.
+Automated trading engine for Polymarket **crypto Up/Down** markets (BTC, ETH, SOL, XRP — 5m and 15m windows), implementing a **gabigol-style** strategy: high-frequency, buy-only, hold-to-redeem farming across thousands of micro-positions.
 
-> **Current strategy:** single active path — **Spike Bot** (`bot/strategy/phase1.py`). Legacy end-of-window Phase 2 reversal (`END_5S_SPIKE_ENABLED: false`) is dormant. Live order routing is **not wired**; use **paper mode** for tuning.
+(https://polymarket.com/@gabigol) (`0x885278f0e304bc2d53f805af2ab779cb6011c569).
+
+> **Disclaimer:** This describes observed public trading patterns and an independent reimplementation. It is **not financial advice**. Past results (e.g. ~$308K cumulative PnL on third-party trackers) do not guarantee future performance. Start with simulation and micro-size live clips.
 
 ---
 
 ## Table of contents
 
-1. [How it works (technical)](#how-it-works-technical)
-2. [System architecture](#system-architecture)
-3. [Per-market state machine](#per-market-state-machine)
-4. [Data feeds & synchronization](#data-feeds--synchronization)
-5. [Entry gates (primary + hedge)](#entry-gates-primary--hedge)
-6. [Risk, kill switch & settlement](#risk-kill-switch--settlement)
-7. [Windows quick start (`.exe`)](#windows-quick-start-exe)
-8. [Developer setup (Python source)](#developer-setup-python-source)
-9. [Dashboard & monitoring](#dashboard--monitoring)
-10. [Configuration reference](#configuration-reference)
-11. [Documentation map](#documentation-map)
-12. [Image guide (where to add screenshots)](#image-guide-where-to-add-screenshots)
-13. [Safety & disclaimer](#safety--disclaimer)
+1. [The core idea — why this can be profitable](#the-core-idea--why-this-can-be-profitable)
+2. [How money is made — the three legs](#how-money-is-made--the-three-legs)
+3. [The math — convergence, lottery, and compounding](#the-math--convergence-lottery-and-compounding)
+4. [Why win rate can be 60% and you still win](#why-win-rate-can-be-60-and-you-still-win)
+5. [What kills the edge](#what-kills-the-edge)
+6. [Visual walkthrough (screenshots)](#visual-walkthrough-screenshots)
+7. [How this bot implements the strategy](#how-this-bot-implements-the-strategy)
+8. [Quick start](#quick-start)
+9. [Configuration reference](#configuration-reference)
+10. [Simulation and validation](#simulation-and-validation)
+11. [Production deployment](#production-deployment)
+12. [Architecture](#architecture)
+13. [Further reading](#further-reading)
 
 ---
 
-## How it works (technical)
+## The core idea — why this can be profitable
 
-Polymarket lists a new BTC Up/Down market every **5 minutes**. At window open **`t₀`**, the strike **`S₀`** is the Chainlink BTC/USD price. At **`tₑ = t₀ + 300s`**, resolution uses Chainlink **`Sₑ`**:
+Most Polymarket bots try to **predict** one outcome per slot and size up when a model says edge exists. The gabigol archetype is different:
 
-| Token | Pays $1 when |
-|-------|----------------|
-| **UP** | `Sₑ > S₀` |
-| **DOWN** | `Sₑ < S₀` |
+**The edge is not one clever bet per market — it is statistical volume across tens of thousands of markets.**
 
-**Coinbase moves before Chainlink** in fast markets. The bot exploits that lead-lag:
+Every 5-minute (or 15-minute) crypto slot is a binary market:
 
-1. **Spike detection** — over a 2s window, compute Coinbase USD move and z-score vs 1s vol.
-2. **Primary entry (phase 1 slot)** — if spike direction is UP/DOWN *and* that side's ask is still an underdog (**$0.25–$0.50**), *and* model EV + distance-to-strike checks pass → post a **limit buy** capped at $0.50.
-3. **Hold to resolution** — no take-profit, no stop-loss on the primary.
-4. **Reversal hedge (phase 2 slot)** — if an **opposite** spike fires while primary is open *and* `primary_entry + hedge_ask ≤ 1.00` → **IOC buy** matched share count on the opposite side (no-loss pair).
-5. **Settlement** — at `tₑ`, open legs redeem at $1 or $0 per Chainlink outcome.
+- Will BTC finish **above** the opening reference price (**UP** resolves to $1)?
+- Or **below** it (**DOWN** resolves to $1)?
 
-![Spike bot timeline — add screenshot](docs/images/01-spike-timeline.png)
-<!-- IMAGE 01: 5-min window diagram: t₀ (S₀), Coinbase spike, primary fill, optional hedge, tₑ resolution.
-     Suggested: horizontal timeline with Chainlink vs Coinbase price lines diverging then converging. -->
+Shares trade between $0.00 and $1.00. At resolution, winning shares pay **$1.00**; losing shares pay **$0.00**.
 
-![Lead-lag concept — add screenshot](docs/images/02-lead-lag-coinbase-chainlink.png)
-<!-- IMAGE 02: Dual price chart showing Coinbase leading Chainlink near strike cross.
-     Helps readers understand why gap is a feature, not just noise. -->
+The strategy runs **three concurrent scanners** on every active slot and almost **never sells**. Profit comes from **redemption at resolution**, not from exiting into the book. Over ~1.9M lifetime buys (observed on gabigol), that means:
 
-**Why underdog only (`ask ≤ 0.50`)?** The edge is buying mispriced probability before the CLOB catches up. Paying >50¢ on a spike direction usually means the market already agrees — little remaining edge.
+| Behavior | Observed pattern |
+|----------|------------------|
+| Buy:Sell ratio | ~3,499 : 1 |
+| Median clip | ~$1.92 |
+| Markets traded | ~100K+ |
+| Per-market win rate | ~60% |
+| Profit factor | ~2.4× |
+| Cumulative PnL (Struct, Jul 2026) | ~$308K on ~$20.6M volume |
 
-**Why no TP/SL?** Resolution is binary; the hedge replaces a stop: when both legs fill at combined cost ≤ $1, worst-case payout is $1 regardless of direction.
-
----
-
-## System architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           BotRunner (100ms tick)                        │
-├──────────────┬──────────────┬──────────────┬──────────────┬─────────────┤
-│ Feeds        │ Features     │ Strategy     │ Risk         │ Execution   │
-│ RTDS CL      │ σ, μ, p_model│ Phase1Strategy│ Kelly/limits │ Paper fills │
-│ Coinbase L2  │ cb_spike_z   │ primary+hedge │ kill switch  │ (live stub) │
-│ Polymarket WS│ gap, sync_ok │              │ gap halt     │             │
-└──────────────┴──────────────┴──────────────┴──────────────┴─────────────┘
-         │                              │                    │
-         └──────── SQLite (data/bot.db) ┴──── JSON status ───┘
-                                              data/bot_status.json
-```
-
-![Architecture diagram — add screenshot](docs/images/03-architecture-diagram.png)
-<!-- IMAGE 03: Polished version of the ASCII diagram above, or a draw.io export.
-     Show three external WS feeds → FeatureEngine → StrategyEngine → PaperGateway. -->
-
-### Module map
-
-| Path | Role |
-|------|------|
-| `bot/runner.py` | Async main loop: discover market → hydrate books → tick → settle |
-| `bot/strategy/engine.py` | Routes ticks to `Phase1Strategy` only |
-| `bot/strategy/phase1.py` | Spike primary + reversal hedge logic |
-| `bot/features/feature_engine.py` | Per-tick snapshot: vol, momentum, `p_model_up`, spikes |
-| `bot/features/probability.py` | GBM-style `P(UP)` from Chainlink moneyness + gap adjustment |
-| `bot/feeds/price_sync.py` | Merges oracle + lead; computes `gap_usd`, `sync_ok` |
-| `bot/feeds/polymarket_rtds.py` | Chainlink via `wss://ws-live-data.polymarket.com` (no API key) |
-| `bot/feeds/btc_coinbase.py` | Coinbase ticker + L2 for spike / OFI |
-| `bot/feeds/polymarket_ws.py` | CLOB L2 order book WebSocket |
-| `bot/execution/paper.py` | Simulated limit/IOC fills with book-walk + latency |
-| `bot/risk/limits.py` | Per-trade notional caps, equity floor |
-| `bot/risk/kill_switch.py` | `KILL` file, feed staleness watchdog |
-| `bot/persistence/db.py` | SQLite: trades, snapshots, market resolution |
-| `bot/ui/api.py` | FastAPI dashboard backend |
-| `config/parameters.yaml` | All strategy constants (single source of tunables) |
-| `config/config.yaml` | Runtime: URLs, paths, wallet placeholders |
-
-### Main loop (one 5-minute market)
-
-Source: `bot/runner.py`
-
-1. **Pick market** — nearest active BTC 5m slug via Gamma REST.
-2. **Subscribe** — CLOB WS for UP/DOWN token IDs; REST hydrate initial L2.
-3. **Resolve S₀** — Chainlink price at `t₀` from RTDS history; set `s0_quality`:
-   - `exact` — joined within ~10s of open (**required for primary entry**)
-   - `approximate` — joined mid-window → **primary entries skipped**
-4. **Tick loop** (~100ms until `tₑ + 3s`):
-   - Feed health gate (`KillSwitch.feeds_ok`)
-   - Gap halt (blocks **new entries** only)
-   - `FeatureEngine.tick()` → `FeatureSnapshot`
-   - `Phase1Strategy.on_tick()` → `Signal` list
-   - Risk check → paper execute (live raises warning and skips)
-5. **Settlement** — both phase slots resolve at $1/$0 per Chainlink vs `S₀`.
-
-Optional **trading schedule** (`P1_SCHEDULE_ENABLED`): sleep outside configured ET hours (default 8:00–18:00). Currently **off** for 24/7 paper collection.
-
----
-
-## Per-market state machine
+A **60% market win rate** sounds mediocre until you see the payoff shape: thousands of small convergence clips (+1–6% each) plus occasional lottery jackpots (10×–30× on cheap tickets) compound faster than the full-premium losses on wrong-side lottery legs.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Observe
-    Observe --> PrimaryOpen: spike + all gates pass
-    Observe --> Observe: blocked / no signal
-    PrimaryOpen --> Hedged: opposite spike + pair cost ≤ 1.0
-    PrimaryOpen --> Resolve: window ends
-    Hedged --> Resolve: window ends
-    Resolve --> [*]
+flowchart LR
+  subgraph inputs [Every 5m slot]
+    Slot[New BTC Up/Down window]
+  end
+  subgraph legs [Three buy-only legs]
+    Conv[Convergence 94-99c]
+    Lot[Lottery 3-30c]
+    Mid[Mid 30-94c]
+  end
+  subgraph output [PnL source]
+    Redeem[Hold to resolution]
+    Dollar[Winning shares -> $1.00]
+  end
+  Slot --> Conv
+  Slot --> Lot
+  Slot --> Mid
+  Conv --> Redeem
+  Lot --> Redeem
+  Mid --> Redeem
+  Redeem --> Dollar
 ```
 
-| State | Phase slots | Allowed actions |
-|-------|-------------|-----------------|
-| Observe | none | Primary entry only (max 1 signal per market) |
-| Primary open | phase 1 filled | Hedge entry only |
-| Hedged | phase 1 + phase 2 filled | **Nothing** — hold to resolution |
-| Window end | any open | Settle at $1 / $0 |
+**Screenshot placeholder — market context**
 
-![State machine — add screenshot](docs/images/04-state-machine.png)
-<!-- IMAGE 04: Render the mermaid state diagram or a simple flowchart for non-GitHub viewers. -->
+<!-- Add: docs/screenshots/01-polymarket-updown-market.png -->
+![Polymarket 5m Up/Down market](docs/screenshots/01-polymarket-updown-market.png)
 
-At most **one primary** and **one hedge** per market. `_primary_signaled` prevents duplicate primary signals even if the first limit does not fill.
+*A live crypto Up/Down slot: countdown, price to beat, UP/DOWN ask prices. Each row is one independent “coin flip with a clock.”*
 
 ---
 
-## Data feeds & synchronization
+## How money is made — the three legs
 
-| Feed | Source | Used for |
-|------|--------|----------|
-| **Oracle** | Polymarket RTDS `crypto_prices_chainlink` | `S₀`, `Sₜ`, `Sₑ`, `p_model` anchor |
-| **Lead** | Coinbase WS `BTC-USD` ticker + level2 | Spike detection, momentum, OFI |
-| **Market** | Polymarket CLOB REST + WS | UP/DOWN bids/asks, L2 depth |
+### Leg A — Convergence (~48% of buys) — the payroll engine
 
-### Synchronization (`PriceSync`)
+**When:** Last ~60–180 seconds of a slot (default: 120s).
 
-A tick is valid when Coinbase is fresh and Chainlink is within staleness bounds:
+**What:** The outcome is nearly decided — spot price vs “price to beat” strongly favors UP or DOWN. The **winning side** still has asks in the **94–99.5¢** range before the book fully closes.
 
-```
-sync_ok = (age_cb ≤ FEED_SYNC_MAX_MS) AND (age_cl ≤ WATCHDOG_BTC_STALE_MS)
-```
+**Action:** Burst **FOK** (fill-or-kill) buys in **~$2 clips** on the likely winner. Hold until resolution. Each winning share redeems at **$1.00**.
 
-Defaults: `FEED_SYNC_MAX_MS = 3500`, `WATCHDOG_BTC_STALE_MS = 12000`. Chainlink RTDS ticks are sparse, so oracle uses a longer window than Coinbase.
+**Profit per winning ticket:** roughly **+1% to +6%** gross per share (e.g. buy at 98¢ → receive $1.00 = 2¢ / 98¢ ≈ 2% before fees).
 
-If `sync_ok` is false → strategy emits **no signals** (`Phase1Strategy` checks `feat.sync_ok`).
+This leg fires **most often** and **most reliably**. It is thin margin per trade, but gabigol runs it **thousands of times per day** across BTC, ETH, SOL, XRP 5m books simultaneously. That is the “noise farming” core.
 
-### Spike features (each tick)
+**Screenshot placeholder — convergence book**
 
-Window: `P1_SPIKE_WINDOW_MS` (default **2000 ms**).
+<!-- Add: docs/screenshots/02-orderbook-convergence.png -->
+![Convergence order book](docs/screenshots/02-orderbook-convergence.png)
 
-```
-cb_spike_usd = last_trade - price_at_window_start
-cb_spike_z   = log_return / (sigma_1s * sqrt(window_s))
-```
-
-- **UP spike:** `cb_spike_z ≥ 2.0` AND `cb_spike_usd ≥ $12`
-- **DOWN spike:** `cb_spike_z ≤ -2.0` AND `cb_spike_usd ≤ -$12`
-
-### Gap halt
-
-```
-gap_usd = coinbase_mid - chainlink_price
-gap_blocked = |gap_usd| ≥ GAP_HALT_USD  OR  |gap_z| ≥ GAP_Z_HALT
-```
-
-Defaults: `GAP_HALT_USD = 100`, `GAP_Z_HALT = 10`. Blocks **new ENTER signals** only (does not force-exit). Wide gaps are normal during real lead spikes; the halt is a **data-glitch ceiling**, not a trading stop at $25.
-
-![Live feeds panel — add screenshot](docs/images/05-feeds-sync-ok.png)
-<!-- IMAGE 05: Dashboard or terminal showing chainlink_price, coinbase_mid, gap_usd, sync_ok.
-     Annotate green/red states for sync_ok and gap_blocked. -->
+*Late-slot book: winner side clustered at 94–99¢. The bot sweeps these asks in rapid FOK bursts.*
 
 ---
 
-## Entry gates (primary + hedge)
+### Leg B — Lottery (~21% of buys) — the tail-risk engine
 
-### Primary (phase 1) — all must pass
+**When:** Mid-slot, while uncertainty is still meaningful (default: 60–280 seconds remaining).
 
-| # | Gate | Parameter (default) |
-|---|------|---------------------|
-| 1 | Feeds synchronized | `sync_ok` |
-| 2 | Not already signaled | `_primary_signaled` |
-| 3 | Time remaining | `T ≥ P1_MIN_T_S` (2s) |
-| 4 | Exact S₀ | `s0_quality == "exact"` |
-| 5 | Spike direction | § spike features |
-| 6 | Underdog price band | ask ∈ [$0.25, $0.50] |
-| 7 | Distance-to-strike | `|spike_usd| ≥ 0.5 × distance_to_S₀` |
-| 8 | EV gate | `p_win > ask + 0.02` |
-| 9 | Liquidity | ≥ $30 within 3¢ of ask |
-| 10 | Not gap-blocked | runner |
-| 11 | Risk `can_open()` | notional + exposure caps |
+**What:** The **likely losing** side still trades at **3–30¢**. These are cheap “lottery tickets.”
 
-**Order:** limit buy, price capped at `P1_ENTRY_MAX_PRICE` ($0.50), fixed **$10** notional (`P1_FIXED_NOTIONAL_USD`).
+**Action:** Small **~$0.50–$3** FOK clips on the underdog.
 
-### Distance-to-strike
+| Outcome | PnL on clip |
+|---------|-------------|
+| Underdog wins (upset) | **+300% to +3000%** (e.g. 10¢ → $1.00 = 10×) |
+| Underdog loses | **−100%** of premium (lose the $1.50 clip) |
 
-```
-if side == UP:  needed = max(0, S₀ - chainlink_price)
-if side == DOWN: needed = max(0, chainlink_price - S₀)
+Losses are **capped** (you only lose the premium). Wins are **uncapped** in ratio terms. You do not need a high hit rate on lottery legs — a few upsets per week across thousands of clips can materially lift session PnL.
 
-pass if |cb_spike_usd| ≥ P1_SPIKE_DIST_RATIO × needed   (ratio = 0.5)
-```
+**Screenshot placeholder — lottery book**
 
-Spike must be large relative to how far Chainlink still needs to move to be in-the-money.
+<!-- Add: docs/screenshots/03-orderbook-lottery.png -->
+![Lottery order book](docs/screenshots/03-orderbook-lottery.png)
 
-### Hedge (phase 2)
-
-Triggered when primary is open and an **opposite** spike fires:
-
-| Gate | Default |
-|------|---------|
-| `P1_HEDGE_ENABLED` | true |
-| Opposite ask | ≤ $0.50 |
-| Pair cost | `primary_entry + hedge_ask ≤ 1.00` |
-| Size | matched shares (same count as primary) |
-| Order type | IOC at ask |
-| Retry cooldown | 500 ms between attempts |
-| Min time left | `T ≥ 1s` |
-
-![Example trade — add screenshot](docs/images/06-example-primary-hedge.png)
-<!-- IMAGE 06: Annotated Polymarket market screenshot or dashboard trade row showing
-     primary entry, opposite hedge, pair cost, and final resolution PnL. -->
-
-Full formula reference: [`docs/SPIKE_BOT_STRATEGY.md`](docs/SPIKE_BOT_STRATEGY.md) and [`docs/STRATEGY.md`](docs/STRATEGY.md) (legacy Phase 2 sections kept for history).
+*Mid-slot: loser side at 3–30¢. Small repeated clips; occasional huge payoff.*
 
 ---
 
-## Risk, kill switch & settlement
+### Leg C — Mid conviction (~31% of buys) — the filler
 
-| Control | Behavior |
-|---------|----------|
-| **Per-trade cap** | $10 primary (`P1_FIXED_NOTIONAL_USD`) |
-| **Equity floor** | Stops new entries if equity < $200 |
-| **Gap halt** | Blocks entries when gap extreme (see above) |
-| **Kill file** | Create `KILL` in working directory → graceful stop |
-| **Feed staleness** | Skips ticks; requires `WATCHDOG_RECOVERY_S` (5s) after recovery |
-| **Instance lock** | `data/bot.lock` — only one bot process |
-| **Daily/hourly PnL** | Logged for dashboard; **does not block entries** in paper |
+**When:** Rest of the slot, when convergence is not actively bursting.
 
-Settlement (`runner._settle_open_positions`): at window end, Chainlink `Sₑ` vs `S₀` determines winner; each open leg pays $1 or $0.
+**What:** Winner-side asks in the **30–94¢** band — directional conviction without endgame certainty.
 
-**Live trading:** `bot/execution/polymarket_gateway.py` is a stub (`NotImplementedError`). Do not use `--mode live` with real funds until wired and paper-calibrated.
+**Action:** ~$1–$2 FOK clips on the likely winner. Lower edge per trade than convergence, but fills the gap between lottery spray and endgame sweeps.
 
 ---
 
-## Windows quick start (`.exe`)
+### Both sides on the same market — by design
 
-The Windows build packages the bot as a standalone executable — no Python install required for end users.
+In observed data, **~42%** of conditions (61/144 in a 3,500-trade API sample) had **buys on both UP and DOWN** in the same slot. That is **not** classic arb (UP + DOWN < $1). It is:
 
-![Windows folder layout — add screenshot](docs/images/07-windows-folder-layout.png)
-<!-- IMAGE 07: Explorer screenshot of the recommended release folder structure below. -->
+- Lottery clips on the cheap loser **plus**
+- Convergence clips on the expensive winner later in the slot, or
+- Scaling into the wrong cheap side before a late flip.
 
-### Recommended release folder
+Net PnL per slot can be: **small convergence win + total lottery loss**, or **lottery jackpot + convergence win**. The portfolio edge is across **volume**, not per-slot perfection.
 
-Place the `.exe` and config alongside each other:
+**Screenshot placeholder — dual exposure**
 
-```
-Polymarket_BTC_Spike_Bot/
-├── PolymarketSpikeBot.exe      ← your built executable
-├── config/
-│   ├── config.yaml             ← copy from config/config.example.yaml
-│   └── parameters.yaml         ← strategy tunables (ship defaults)
-├── .env                        ← only needed for future live mode
-├── scripts/
-│   ├── run_paper.bat           ← optional wrapper
-│   └── run_dashboard.bat
-├── dashboard/                  ← optional: pre-built UI (npm run build)
-├── data/                       ← created at runtime (bot.db, bot_status.json)
-└── logs/                       ← created at runtime
-```
+<!-- Add: docs/screenshots/07-both-sides-same-slot.png -->
+![Both sides same slot](docs/screenshots/07-both-sides-same-slot.png)
 
-### First run (paper trading)
-
-1. **Unzip** the release folder to a path **without spaces** if possible (e.g. `C:\Bots\PolymarketSpike`).
-2. **Edit** `config\config.yaml` if you need custom paths (defaults work out of the box).
-3. **Double-click** `PolymarketSpikeBot.exe` — or run from PowerShell:
-
-```powershell
-cd C:\Bots\PolymarketSpike
-.\PolymarketSpikeBot.exe --mode paper
-```
-
-4. **Confirm feeds** — console should show:
-   - `Oracle: Polymarket RTDS Chainlink | Lead: Coinbase BTC-USD`
-   - Periodic `T=…s p_up=… gap=…` lines when a market is active
-5. **Stop** — `Ctrl+C` in the console, or create an empty file named `KILL` in the same folder as the exe.
-
-![Windows console running — add screenshot](docs/images/08-windows-console-paper.png)
-<!-- IMAGE 08: Console window showing successful paper start, market slug, S₀, T countdown.
-     Blur any wallet keys if visible. -->
-
-### Other modes
-
-```powershell
-# Config smoke test (no network trading loop)
-.\PolymarketSpikeBot.exe --mode dryrun
-
-# Custom config path
-.\PolymarketSpikeBot.exe --mode paper --config C:\Bots\PolymarketSpike\config\config.yaml
-```
-
-### Batch shortcuts (included in repo)
-
-| Script | Action |
-|--------|--------|
-| `scripts\run_paper.bat` | `python -m bot.main --mode paper` (source install) |
-| `scripts\run_api.bat` | Starts FastAPI on `http://127.0.0.1:8080` |
-| `scripts\run_dashboard.bat` | Vite dev UI on `http://localhost:5173` |
-
-For the **`.exe` build**, replace `python -m bot.main` with `PolymarketSpikeBot.exe` inside your own `run_paper.bat` if you ship one.
-
-### Windows firewall & network
-
-The bot opens **outbound** WebSocket connections only:
-
-| Host | Purpose |
-|------|---------|
-| `wss://ws-live-data.polymarket.com` | Chainlink oracle (RTDS) |
-| `wss://ws-feed.exchange.coinbase.com` | Coinbase BTC-USD |
-| `wss://ws-subscriptions-clob.polymarket.com` | Polymarket order book |
-| `https://gamma-api.polymarket.com` | Market discovery |
-| `https://clob.polymarket.com` | REST order book fallback |
-
-Allow the exe through Windows Defender Firewall on first launch if prompted.
-
-### Troubleshooting (Windows)
-
-| Symptom | Fix |
-|---------|-----|
-| `Another bot instance is already running` | Delete stale `data\bot.lock` after confirming no bot process in Task Manager |
-| No markets / long waits | Check internet; run during active Polymarket BTC 5m hours |
-| `S0 unknown` / no entries | Start the bot **before** the 5m window opens (within ~10s of `t₀`) |
-| `Joined mid-window` warning | Primary skipped for that window — wait for next market |
-| Dashboard empty | Start API (`run_api.bat`) then open UI; bot writes `data\bot_status.json` |
-| `No module named 'fcntl'` on Windows | Source tree uses Unix file locking in `bot/runner.py`; build the `.exe` on Windows with a portalocker/msvcrt patch, or run under WSL |
-
-> **Packaging note:** `bot/runner.py` imports `fcntl` (Linux/macOS). A Windows `.exe` must either patch instance locking for `msvcrt`/`portalocker` or ship a build that already includes that fix.
-
-![Windows troubleshooting — add screenshot](docs/images/09-windows-task-manager.png)
-<!-- IMAGE 09: Optional — Task Manager showing single bot process, or firewall prompt. -->
+*Example: ETH Up 96.5¢ position and ETH Down 10.8¢ position in the same 5m window.*
 
 ---
 
-## Developer setup (Python source)
+## The math — convergence, lottery, and compounding
 
-**Requirements:** Python 3.11+, Node 18+ (dashboard only)
+### Convergence — fee-aware edge
 
-```powershell
-cd C:\26_projects\Underdog_Spike\Polymarket_BTC_5min_Endcycle
-python -m pip install -e ".[dev]"
-# or: pip install -r requirements.txt
+Polymarket charges **taker fees** on FOK orders. For crypto 5m/15m markets, fee rate ≈ **0.072**. Fee in shares:
 
-copy config\config.example.yaml config\config.yaml
-
-# Smoke test
-python -m bot.main --mode dryrun
-
-# Verify feeds
-python scripts\live_price_feed.py
-
-# Paper trade (real feeds, simulated fills)
-python -m bot.main --mode paper
-
-# PnL report
-python scripts\pnl_report.py
-python scripts\pnl_report.py --json
+```
+fee = shares × 0.072 × price × (1 − price)
 ```
 
-Run tests: `pytest` or `make test`.
+**Net edge per share** if the side wins and redeems at $1.00:
 
-Honest implementation audit: [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md).
+```
+netEdge = 1 − price − (0.072 × price × (1 − price))
+```
+
+Implemented in [`engine/strategy/lib/fees.ts`](engine/strategy/lib/fees.ts) as `netEdgePerShare()`. The bot **skips** convergence buys when `netEdge < GABIGOL_MIN_EDGE` (default **0.5%**).
+
+| Ask price | Gross edge (1 − price) | Approx. net edge after taker fee |
+|-----------|------------------------|----------------------------------|
+| 94¢ | 6.0% | ~5.6% |
+| 96¢ | 4.0% | ~3.7% |
+| 98¢ | 2.0% | ~1.6% |
+| 99¢ | 1.0% | ~0.7% |
+
+At **99¢**, fees eat most of the gross clip. Observed gabigol PnL includes **~$20.5K in maker/taker rebates** — at scale, rebates can turn fee-thin 99¢ farming from breakeven into positive expectancy. Smaller independent deployments may not get the same rebate tier.
+
+**Example — one convergence clip**
+
+- Buy **5 shares** UP @ **96¢** FOK → cost ≈ **$4.80**
+- Side wins → redeem **5 × $1.00 = $5.00**
+- Gross profit ≈ **$0.20** (~4.2% on cost)
+- Repeat **500× per day** across 4 assets → small edges aggregate
+
+### Lottery — asymmetric payoff
+
+- Spend **$1.50** on DOWN @ **15¢** (~10 shares after fees)
+- If DOWN loses: **−$1.50**
+- If DOWN wins: **~$10.00** redemption → **+$8.50** (~5.7×)
+
+Break-even hit rate for equal clip sizes: only **~15%** upset rate needed on lottery legs where average win is 6× premium. Observed upset rate is lower, but convergence profits subsidize lottery spray.
+
+### Session-level compounding (observed gabigol stats)
+
+| Metric | Value | Implication |
+|--------|-------|-------------|
+| Avg win (per market) | **+$33.6** | Convergence bursts + occasional lottery hits |
+| Avg loss (per market) | **−$21** | Capped lottery premiums + wrong-side convergence |
+| Profit factor | **2.4×** | Gross wins / gross losses |
+| Max drawdown | **−$6K (−2.6%)** | Many small losses; rare large convergence mistakes |
+| 30d PnL | **~$49K** | Requires capital, speed, and continuous uptime |
+
+```mermaid
+xychart-beta
+    title "Payoff shape per leg (conceptual)"
+    x-axis ["Lottery loss", "Mid win", "Convergence win", "Lottery jackpot"]
+    y-axis "PnL multiple on clip" -1 --> 30
+    bar [-1, 0.5, 0.04, 15]
+```
 
 ---
 
-## Dashboard & monitoring
+## Why win rate can be 60% and you still win
 
-**Backend:** FastAPI (`bot/ui/api.py`) — reads SQLite + `data/bot_status.json`.
+Traditional betting intuition: “You need >50% win rate.” Here, **win rate is measured per market (slot)**, not per individual buy.
 
-**Frontend:** React + Vite (`dashboard/`).
+- A single slot may have **50+ buys** (convergence burst + lottery + mid).
+- **Per-market win rate ~60%** means 40% of slots net negative — often because lottery legs expired worthless or convergence bought the wrong side after a late flip.
+- **Profit factor 2.4×** means winning slots earn **2.4× more dollars** than losing slots lose.
 
-```powershell
-# Terminal 1 — API
-scripts\run_api.bat
-# → http://127.0.0.1:8080
+The strategy is profitable because:
 
-# Terminal 2 — UI (dev)
-cd dashboard
-npm install
-npm run dev
-# → http://localhost:5173
+1. **Convergence** contributes frequent small positive expectancy clips.
+2. **Lottery** contributes positive skew (many −100% premia, rare +1000% hits).
+3. **Volume** — law of large numbers across ~100K markets smooths variance.
+4. **No sell friction** — no spread paid to exit; winners ride to $1.00.
+5. **Rebates** (at scale) — fee program can offset taker cost on 99¢ sweeps.
+
+**Screenshot placeholder — track record**
+
+<!-- Add: docs/screenshots/04-gabigol-profile-struct.png -->
+![Gabigol profile and Struct stats](docs/screenshots/04-gabigol-profile-struct.png)
+
+*Third-party analytics: cumulative PnL, volume, win rate, profit factor.*
+
+---
+
+## What kills the edge
+
+| Risk | Mechanism | Mitigation in this bot |
+|------|-----------|------------------------|
+| **Fee erosion** | 99¢ → $1 is ~1% gross; taker fee can take most of it | `GABIGOL_MIN_EDGE`; skip thin convergence |
+| **Wrong-side 99¢** | Late slot flip → buy loser at 98¢ → ~total loss | Optional `GABIGOL_MIN_GAP_USD`; tune convergence window |
+| **Both-side bleed** | Lottery + convergence in same slot; one leg dies | Separate `GABIGOL_LOTTERY_CAP` / `GABIGOL_MID_CAP` |
+| **Capital lock** | Thousands of open positions need float | `GABIGOL_MARKET_CAP`; wallet buffer ≥ $5K (gabigol runs $100K+) |
+| **Competition** | More bots farm same 5m books → asks vanish faster | Speed, multi-asset fleet, rebate tier |
+| **Regime change** | Polymarket fee/rebate rules or liquidity shift | Monitor; simulate before scaling |
+
+---
+
+## Visual walkthrough (screenshots)
+
+Add images under [`docs/screenshots/`](docs/screenshots/). The README references them below — drop your files in place and they will render automatically.
+
+| # | File | Purpose |
+|---|------|---------|
+| 1 | [`01-polymarket-updown-market.png`](docs/screenshots/01-polymarket-updown-market.png) | Market UI — slot, price to beat, UP/DOWN |
+| 2 | [`02-orderbook-convergence.png`](docs/screenshots/02-orderbook-convergence.png) | Late-slot winner asks 94–99¢ |
+| 3 | [`03-orderbook-lottery.png`](docs/screenshots/03-orderbook-lottery.png) | Mid-slot loser asks 3–30¢ |
+| 4 | [`04-gabigol-profile-struct.png`](docs/screenshots/04-gabigol-profile-struct.png) | PnL / volume / win rate dashboard |
+| 5 | [`05-simulation-chart.png`](docs/screenshots/05-simulation-chart.png) | Engine chart tool output |
+| 6 | [`06-console-burst.png`](docs/screenshots/06-console-burst.png) | Terminal: burst fills, zero sells |
+| 7 | [`07-both-sides-same-slot.png`](docs/screenshots/07-both-sides-same-slot.png) | Dual UP+DOWN exposure one slot |
+
+**Screenshot placeholder — simulation chart**
+
+<!-- Add: docs/screenshots/05-simulation-chart.png -->
+![Simulation chart](docs/screenshots/05-simulation-chart.png)
+
+*Interactive chart from a market log: order book, ticker, fills over time.*
+
+**Screenshot placeholder — live console**
+
+<!-- Add: docs/screenshots/06-console-burst.png -->
+![Console burst output](docs/screenshots/06-console-burst.png)
+
+*`gabigol convergence` / `gabigol lottery` / `gabigol mid` lines — no SELL events.*
+
+---
+
+## How this bot implements the strategy
+
+| Spec behavior | Implementation |
+|---------------|----------------|
+| Buy-only, hold-to-redeem | `ctx.blockSells()` in [`engine/strategy/gabigol.ts`](engine/strategy/gabigol.ts) |
+| Convergence 94–99.5¢ | `PRICE_BANDS.convergence` + last `GABIGOL_CONVERGENCE_MAX_SECS` |
+| Lottery 3–30¢ | `PRICE_BANDS.lottery` + time window 60–280s |
+| Mid 30–94¢ | `PRICE_BANDS.mid` when convergence not bursting |
+| FOK micro-clips | `orderType: "FOK"` via `ctx.postOrders()` |
+| Winner inference | CEX spot vs `openPrice` in [`winner-inference.ts`](engine/strategy/lib/winner-inference.ts) |
+| Fee gate | `netEdgePerShare() >= GABIGOL_MIN_EDGE` |
+| Per-market caps | [`inventory.ts`](engine/strategy/lib/inventory.ts) |
+| Auto-redeem (prod) | Engine lifecycle → `redeemPositions()` via gasless relayer |
+| Multi-asset | [`scripts/run-gabigol.ts`](scripts/run-gabigol.ts) spawns btc/eth/sol/xrp processes |
+
+**Tick loop (every 100ms default):**
+
+```
+1. Read remaining_seconds, openPrice, CEX spot
+2. Infer likely winner (UP/DOWN) from spot vs price-to-beat
+3. Lottery scanner  → FOK buy loser if ask ∈ [3¢, 30¢]
+4. Convergence scan → burst FOK buy winner if ask ∈ [94¢, 99.5¢] and net edge OK
+5. Mid scanner      → FOK buy winner if ask ∈ [30¢, 94¢] and convergence idle
+6. At slot end      → hold releases; engine redeems winners
 ```
 
-Production UI: `npm run build` in `dashboard/`, then serve static files from the API port.
+---
 
-![Dashboard overview — add screenshot](docs/images/10-dashboard-overview.png)
-<!-- IMAGE 10: Overview page — equity, daily PnL, active market T-remaining, gap, p_model. -->
+## Quick start
 
-![Dashboard trades — add screenshot](docs/images/11-dashboard-trades.png)
-<!-- IMAGE 11: Trades table with primary/hedge phases, entry context, resolution outcome. -->
+### Prerequisites
 
-![Dashboard parameters — add screenshot](docs/images/12-dashboard-parameters.png)
-<!-- IMAGE 12: Parameters panel showing key P1_* tunables (optional for power users). -->
+- Node.js 18+ (or [Bun](https://bun.sh))
+- Polygon wallet funded with **pUSD** for production ([`docs/MIGRATE_V2.md`](docs/MIGRATE_V2.md))
 
-**Runtime status file:** `data/bot_status.json` — updated every ~10s during active markets (slug, `T_remaining`, prices, gap, equity).
+### Install
 
-**Logs:** `logs/bot.log` (JSON lines in non-paper modes), `logs/limit_orders.jsonl`.
+```bash
+git clone <this-repo> gabigol
+cd gabigol
+npm install          # or: bun install
+cp .env.example .env
+```
+
+### Simulation (recommended first)
+
+```bash
+# Single asset, 20 rounds (~100 minutes real time for 5m windows)
+npm run gabigol:sim
+
+# Or explicitly:
+npx tsx index.ts --strategy gabigol --slot-offset 1 --rounds 20 --always-log
+```
+
+Raise `MAX_SESSION_LOSS` (e.g. `200`) if you want the full 20 rounds without early shutdown on drawdown.
+
+### Multi-asset fleet
+
+```bash
+npx tsx scripts/run-gabigol.ts
+```
+
+Spawns parallel processes: `btc`, `eth`, `sol`, `xrp` — each `MARKET_WINDOW=5m`.
+
+### Production
+
+```bash
+# Edit .env: PRIVATE_KEY, POLY_FUNDER_ADDRESS, BUILDER_*, FORCE_PROD=true
+npm run gabigol:prod
+
+# Periodic batch redeem backup
+npx tsx scripts/redeem.ts
+```
 
 ---
 
 ## Configuration reference
 
-| File | Purpose |
-|------|---------|
-| `config/parameters.yaml` | Strategy constants (`P1_*`, gap, vol, risk) — **edit to tune** |
-| `config/config.yaml` | URLs, DB path, wallet env vars, logging |
-| `.env` | `POLY_*` credentials for future live mode (not needed for paper) |
+### Engine (`.env`)
 
-Key spike parameters (defaults in `config/parameters.yaml`):
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TICKER` | `polymarket,binance` | Price feeds for winner inference |
+| `MARKET_ASSET` | `btc` | Per-process asset (`btc`/`eth`/`sol`/`xrp`) |
+| `MARKET_WINDOW` | `5m` | `5m` or `15m` |
+| `MAX_SESSION_LOSS` | `50` | Stop engine when cumulative losses exceed this |
+| `WALLET_BALANCE` | `5000` | Simulated balance (paper trading) |
+| `PRIVATE_KEY` | — | Required for `--prod` |
+| `POLY_FUNDER_ADDRESS` | — | Polymarket proxy/funder wallet |
+| `BUILDER_KEY/SECRET/PASSPHRASE` | — | Gasless relayer (redeem) |
 
-| Parameter | Default | Meaning |
-|-----------|---------|---------|
-| `P1_SPIKE_MIN_Z` | 2.0 | Min z-score for spike |
-| `P1_SPIKE_MIN_USD` | 12 | Min absolute USD move |
-| `P1_ENTRY_MAX_PRICE` | 0.50 | Underdog cap |
-| `P1_FRICTION` | 0.02 | EV buffer over ask |
-| `P1_FIXED_NOTIONAL_USD` | 10 | Primary size |
-| `P1_HEDGE_PAIR_MAX` | 1.0 | Max combined entry + hedge ask |
-| `P1_SCHEDULE_ENABLED` | false | ET trading window filter |
+### Gabigol strategy
 
-Full list: [`docs/PARAMETERS.md`](docs/PARAMETERS.md).
+| Variable | Default | Profitability role |
+|----------|---------|-------------------|
+| `GABIGOL_CLIP_NOTIONAL` | `2.0` | Convergence clip size — core payroll unit |
+| `GABIGOL_MIN_EDGE` | `0.005` | Skip convergence when fee-adjusted edge < 0.5% |
+| `GABIGOL_MARKET_CAP` | `200` | Max $ per slot — limits blow-up on wrong-side bursts |
+| `GABIGOL_LOTTERY_CAP` | `30` | Caps lottery bleed per slot |
+| `GABIGOL_LOTTERY_CLIP_NOTIONAL` | `1.5` | Lottery ticket size — controls tail variance |
+| `GABIGOL_CONVERGENCE_MAX_SECS` | `120` | Endgame window length |
+| `GABIGOL_BURST_PER_TICK` | `3` | FOK orders per 100ms tick in convergence |
+| `GABIGOL_MIN_GAP_USD` | `0` | Require \|spot − open\| before trading (0 = aggressive) |
 
----
-
-## Documentation map
-
-Read in this order for deep dives:
-
-| # | File | Purpose |
-|---|------|---------|
-| 1 | [`docs/SPIKE_BOT_STRATEGY.md`](docs/SPIKE_BOT_STRATEGY.md) | **Current** spike + hedge spec tied to code |
-| 2 | [`docs/STRATEGY.md`](docs/STRATEGY.md) | Full math (includes legacy Phase 2 reversal) |
-| 3 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Modules, APIs, data flows |
-| 4 | [`docs/PARAMETERS.md`](docs/PARAMETERS.md) | Every tunable with ranges |
-| 5 | [`docs/BACKTESTING.md`](docs/BACKTESTING.md) | Replay / walk-forward (planned) |
-| 6 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Ops, secrets, kill switches, live checklist |
-| 7 | [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | What is real vs stub |
+Full list: [`.env.example`](.env.example) and [`docs/GABIGOL.md`](docs/GABIGOL.md).
 
 ---
 
-## Image guide (where to add screenshots)
+## Simulation and validation
 
-Create folder **`docs/images/`** and add the files below. Until they exist, Markdown will show broken image links — that is intentional so you know what to capture.
+After a sim session, verify profitability mechanics are firing correctly:
 
-| File | Section | What to capture |
-|------|---------|-----------------|
-| `01-spike-timeline.png` | How it works | 5-min window: S₀, spike, entry, hedge, resolution |
-| `02-lead-lag-coinbase-chainlink.png` | How it works | Coinbase vs Chainlink price lines near strike |
-| `03-architecture-diagram.png` | Architecture | Module / data-flow diagram |
-| `04-state-machine.png` | State machine | Observe → Primary → Hedged → Resolve flowchart |
-| `05-feeds-sync-ok.png` | Data feeds | Live gap, sync_ok, stale flags (UI or logs) |
-| `06-example-primary-hedge.png` | Entry gates | Real or paper trade with pair cost annotated |
-| `07-windows-folder-layout.png` | Windows `.exe` | Explorer view of release folder |
-| `08-windows-console-paper.png` | Windows `.exe` | Console output during paper session |
-| `09-windows-task-manager.png` | Windows troubleshooting | Single process / firewall (optional) |
-| `10-dashboard-overview.png` | Dashboard | Overview page |
-| `11-dashboard-trades.png` | Dashboard | Trades / resolution table |
-| `12-dashboard-parameters.png` | Dashboard | Parameters panel (optional) |
+```bash
+# Visual timeline of one slot
+npx tsx scripts/chart.ts logs/early-bird-btc-updown-5m-*.log --open
+```
 
-**Tips for good screenshots**
+**Checklist**
 
-- Use **1920×1080** or **1440×900**; crop to the relevant panel.
-- **Blur** private keys, wallet addresses, and API credentials.
-- Prefer **light annotations** (arrows, labels) on timeline and trade examples.
-- For `08`, capture a moment when `T=` is between 60s and 300s and feeds are green.
+- [ ] `gabigol convergence` fills at 94–99¢ in final ~120s
+- [ ] `gabigol lottery` fills at 3–30¢ mid-slot
+- [ ] `gabigol mid` fills at 30–94¢
+- [ ] **Zero** `SELL` lines in console or logs
+- [ ] `Redemption successful` on resolved winners (prod/sim)
+- [ ] Per-slot spend ≤ `GABIGOL_MARKET_CAP`
+
+**Example sim outcome (BTC, 5 rounds before loss limit):**
+
+- Session PnL reached **+$209** on **$5,000** sim wallet
+- All three scanners logged hundreds of FOK fills
+- Shutdown triggered by `MAX_SESSION_LOSS=$50` (tune upward for longer runs)
 
 ---
 
-## Safety & disclaimer
+## Production deployment
 
-- **Paper first.** Live gateway is not production-ready.
-- **Binary options risk.** You can lose entire position notional each window.
-- **Model risk.** Spike detection and `p_model` assume regimes similar to calibration data.
-- **Clock & feeds.** Bad sync or stale RTDS can skip entries or mis-estimate `S₀`.
-- **Not financial advice.** Personal/educational project only.
+1. **Fund pUSD** on your Polymarket proxy wallet.
+2. **Simulate** ≥10 rounds; confirm burst/lottery patterns in charts.
+3. **Set risk:** `MAX_SESSION_LOSS`, `GABIGOL_MARKET_CAP` for your bankroll.
+4. **Run fleet:** `npm run gabigol:prod` (4 assets × 5m).
+5. **Redeem:** engine auto-redeems; also run `npx tsx scripts/redeem.ts` after sessions.
+6. **Monitor:** wallet balance, fill rate, convergence rejection rate, session PnL.
 
-**Kill switch:** create empty file `KILL` in the bot working directory.
+**Capital guidance (from observed gabigol scale)**
 
-**Max exposure (defaults):** $10 primary + up to matched hedge notional per market; one market at a time.
+| Parameter | Gabigol-like | Small independent start |
+|-----------|--------------|---------------------------|
+| Wallet buffer | $100K+ pUSD | $5K–$10K |
+| Per-clip notional | $1.50–$2.00 | $1.00–$2.00 |
+| Per-market cap | $50–$300 | $20–$50 |
+| Concurrent markets | Many (4 assets × continuous slots) | 1–4 processes |
 
 ---
 
-## Tech stack
+## Architecture
 
-| Layer | Choice |
-|-------|--------|
-| Language | Python 3.11+ (asyncio) |
-| Polymarket | `py-clob-client` + CLOB WebSocket |
-| Oracle | Polymarket RTDS Chainlink (no API key) |
-| Lead | Coinbase WebSocket |
-| Math | numpy, scipy |
-| Storage | SQLite + optional Parquet archive |
-| Config | Pydantic + YAML |
-| Logging | Loguru |
-| Dashboard | FastAPI + React/Vite |
+```
+┌──────────────────────────────────────────────────────────────┐
+│  scripts/run-gabigol.ts                                      │
+│    ├── process: MARKET_ASSET=btc  → EarlyBird + gabigol      │
+│    ├── process: MARKET_ASSET=eth  → EarlyBird + gabigol      │
+│    ├── process: MARKET_ASSET=sol  → EarlyBird + gabigol      │
+│    └── process: MARKET_ASSET=xrp  → EarlyBird + gabigol      │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  EarlyBird engine (per process)                              │
+│    MarketLifecycle per slot → gabigol strategy tick loop     │
+│    CLOB WS order book + CEX ticker + FOK placement           │
+│    Resolution → redeemPositions (gasless relayer)            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Key files**
+
+```
+engine/strategy/gabigol.ts              # Three scanners, blockSells, hold-to-redeem
+engine/strategy/lib/fees.ts             # Taker fee + net edge
+engine/strategy/lib/inventory.ts        # Per-slot spend caps
+engine/strategy/lib/winner-inference.ts # UP/DOWN from spot vs open
+scripts/run-gabigol.ts                  # Multi-asset launcher
+```
+
+---
+
+## Further reading
+
+| Doc | Contents |
+|-----|----------|
+| [`docs/GABIGOL.md`](docs/GABIGOL.md) | Strategy params, risks, prod checklist |
+| [`docs/GUIDE.md`](docs/GUIDE.md) | Engine API, strategy development |
+| [`docs/LEARNING.md`](docs/LEARNING.md) | Prediction markets primer |
+| [`docs/MIGRATE_V2.md`](docs/MIGRATE_V2.md) | USDC.e → pUSD migration |
+| [`docs/screenshots/`](docs/screenshots/) | Drop visual assets here |
+
+---
+
+## License
+
+MIT — engine from [KaustubhPatange/polymarket-trade-engine](https://github.com/KaustubhPatange/polymarket-trade-engine). Gabigol strategy implementation and documentation in this fork.

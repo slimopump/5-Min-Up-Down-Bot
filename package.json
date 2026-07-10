@@ -1,0 +1,30 @@
+{
+  "name": "early-bird-engine",
+  "module": "index.ts",
+  "type": "module",
+  "scripts": {
+    "check": "tsc -b --noEmit",
+    "start": "tsx index.ts",
+    "gabigol:sim": "tsx index.ts --strategy gabigol --slot-offset 1 --rounds 20 --always-log",
+    "gabigol:prod": "tsx scripts/run-gabigol.ts --prod"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/sinon": "^21.0.1",
+    "prettier": "^3.8.1",
+    "sinon": "^21.1.2",
+    "tsx": "^4.23.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@ethersproject/wallet": "^5.8.0",
+    "@js-sdsl/ordered-map": "^4.4.2",
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@tailwind-ts/eslint-plugin": "^0.3.0",
+    "@polymarket/clob-client-v2": "^1.0.2",
+    "commander": "^14.0.3",
+    "ethers": "^6"
+  }
+}
